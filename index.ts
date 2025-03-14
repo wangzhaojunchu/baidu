@@ -6,10 +6,12 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { HttpsCookieAgent } from "http-cookie-agent/http"
 import { getHector } from "./hector"
 // @ts-ignore
-import tld from "tld"
-const jar = new CookieJar();
+import { parseUrl } from 'extract-tld';
 
+const jar = new CookieJar();
+process.env.debug = "1";
 let _debug = Boolean(process.env.debug)
+console.log("debug mode:", _debug)
 // const httpsAgent = new HttpsProxyAgent("http://127.0.0.1:8080",{
 //     keepAlive: true
 // })
@@ -51,16 +53,18 @@ export class SearchPC {
 
     running: boolean = false
 
-    async run(word: string, expect: number) {
-
-        const brs = new BaiduResults()
+    async run(word: string, expect: number,maxRetry=3) {
+        let retry = 0
+        const brs = new BaiduResults(word)
         const indexResp = await axios.get(this.homeUrl, {
             responseType: "arraybuffer",
         })
 
-        let { window: { document } } = new JSDOM(indexResp.data)
+        let { window: { document } } = new JSDOM(indexResp.data,{
+            resources: "usable"
+        })
 
-        while (brs.length < expect) {
+        while (brs.items.length < expect && retry < maxRetry) {
             //获取下一页链接
             _debug && console.log('title:', document.title)
             if (document.title.includes("百度安全验证")) {
@@ -70,6 +74,7 @@ export class SearchPC {
             //检测收录信息
             const index_one = document.querySelector(".op_site_domain_right b")
             const index_two = document.querySelector(".site_tip b")
+            brs.words = [...brs.words, ...[...document.querySelectorAll("#rs_new td")].map(item=>item.textContent ?? "").filter(item=>item)]
 
             if (index_one || index_two) {
                 const indexedArr = (index_one?.textContent ?? index_two?.textContent ?? "0").match(/\d+/g)
@@ -79,7 +84,8 @@ export class SearchPC {
 
             const results = await this.getResults(document)
             _debug && console.log('results:', results)
-            brs.push(...results)
+            brs.items.push(...results)
+            retry++
         }
         return brs;
     }
@@ -142,8 +148,8 @@ export class SearchPC {
 
         return new JSDOM(firstPageResp.data).window.document
     }
-    async getResults(document: Document): Promise<BaiduResults> {
-        const brs = new BaiduResults()
+    async getResults(document: Document): Promise<BaiduResult[]> {
+        const brs:BaiduResult[] = []
         document.querySelectorAll(".result").forEach(result => {
             try {
                 const title = result.querySelector(".c-title")?.textContent ?? ""
@@ -151,7 +157,7 @@ export class SearchPC {
                 const showName = result.querySelector(".c-color-gray")?.textContent ?? ""
                 const siteUrl = result.getAttribute("mu") ?? ""
                 const host = new URL(siteUrl).host;
-                const domain = tld.registered(host)
+                const domain = parseUrl(siteUrl).domain
                 brs.push(new BaiduResult(title, des, siteUrl, showName, host, domain))
             } catch (ex) {
 
@@ -173,22 +179,29 @@ export class SearchWap extends SearchPC {
 
     running: boolean = false
 
-    async run(word: string, expect: number) {
-
-        const brs = new BaiduResults()
+    async run(word: string, expect: number,maxRetry=3) {
+        let retry = 0
+        const brs = new BaiduResults(word)
         const indexResp = await axios.get(this.homeUrl, {
             responseType: "arraybuffer"
         })
 
         let { window: { document } } = new JSDOM(indexResp.data)
 
-        while (brs.length < expect) {
+        while (brs.items.length < expect && retry < maxRetry) {
             _debug && console.log('title:', document.title)
+            if (document.title.includes("百度安全验证")) {
+                throw new Error("百度安全验证")
+            }
+            brs.words = [...brs.words,...document.querySelectorAll(".cos-no-underline")]?.map(item=>(item as Element).textContent ?? "").filter(item => item)
+
             document = await this.getNextPage(document, word)
             const results = await this.getResults(document)
             _debug && console.log('results:',results)
-            brs.push(...results)
+            brs.items.push(...results)
+            retry++
         }
+        
         return brs;
     }
 
@@ -222,16 +235,18 @@ export class SearchWap extends SearchPC {
         // console.log("document:", new JSDOM(firstPageResp.data).window.document)
         return new JSDOM(firstPageResp.data).window.document
     }
-    async getResults(document: Document): Promise<BaiduResults> {
-        const brs = new BaiduResults()
+    async getResults(document: Document): Promise<BaiduResult[]> {
+        const brs:BaiduResult[] = []
         document.querySelectorAll(".c-result").forEach(result => {
             try {
                 const title = result.querySelector(".tts-b-hl,.c-title")?.textContent ?? ""
+                if(title == "大家还在搜") throw new Error("not one of result")
                 const des = result.querySelector("div[role=text],.ec-full-text-container")?.textContent ?? ""
                 const showName = result.querySelector(".cosc-source,.cos-text-body")?.textContent ?? ""
                 const siteUrl = JSON.parse(result.getAttribute("data-log") ?? "{}")?.mu ?? ""
                 const host = new URL(siteUrl).host;
-                const domain = tld.registered(host)
+                console.log("siteUrl",siteUrl)
+                const domain = parseUrl(siteUrl).domain
                 brs.push(new BaiduResult(title, des, siteUrl, showName, host, domain))
             } catch (ex) {
                 _debug && console.log('parse error')
@@ -259,15 +274,24 @@ export class BaiduResult {
     }
 }
 
-export class BaiduResults extends Array<BaiduResult> {
-    indexed: number
-    indexedOnFirstPage: number
-
-    constructor(...args: any) {
-        super(...args)
-        this.indexed = -1
-        this.indexedOnFirstPage = -1
+export class BaiduResults {
+    indexed: number = -1
+    indexedOnFirstPage: number = -1
+    words: string[] = []
+    keyword: string
+    items: BaiduResult[] = []
+    constructor(word:string) {
+        this.keyword = word
     }
+    // toJson(){
+    //     return {
+    //         items: [...this], // 复制数组元素
+    //         indexed: this.indexed, // 复制额外属性
+    //         indexedOnFirstPage: this.indexedOnFirstPage, // 复制额外属性
+    //         words: this.words, // 复制额外属性
+    //         keyword: this.keyword, // 复制额外属性
+    //     };
+    // }
 }
 
 // export default { BaiduResult, BaiduResults, SearchPC, SearchWap }
